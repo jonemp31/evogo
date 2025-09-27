@@ -1,149 +1,141 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jonemp31/evogo/internal/models"
 	"github.com/jonemp31/evogo/internal/repository"
 	"go.uber.org/zap"
 )
 
+// InstanceManager gerencia o ciclo de vida das instâncias do WhatsApp.
 type InstanceManager struct {
-	Instances      map[string]*WhatsAppClient
-	mu             sync.Mutex
 	repo           repository.InstanceRepository
+	webhookService WebhookSender
 	logger         *zap.Logger
-	webhookService *WebhookService
+	instances      sync.Map // Armazena os clientes ativos: [instanceName]*WhatsAppClient
 }
 
-func NewInstanceManager(repo repository.InstanceRepository, logger *zap.Logger, webhookService *WebhookService) *InstanceManager {
+// NewInstanceManager cria um novo gerenciador de instâncias.
+func NewInstanceManager(repo repository.InstanceRepository, webhookService WebhookSender, logger *zap.Logger) *InstanceManager {
 	return &InstanceManager{
-		Instances:      make(map[string]*WhatsAppClient),
 		repo:           repo,
-		logger:         logger,
 		webhookService: webhookService,
+		logger:         logger,
+		instances:      sync.Map{},
 	}
 }
 
-func (m *InstanceManager) CreateInstance(instanceData models.Instance) (*models.Instance, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.Instances[instanceData.Name]; exists {
-		return nil, fmt.Errorf("instância '%s' já existe", instanceData.Name)
+// CreateInstance cria uma nova instância no banco de dados.
+func (m *InstanceManager) CreateInstance(ctx context.Context, instanceData *models.Instance) (*models.Instance, error) {
+	existing, err := m.repo.FindByName(instanceData.Name)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao verificar instância existente: %w", err)
+	}
+	if existing != nil {
+		return nil, fmt.Errorf("instância com o nome '%s' já existe", instanceData.Name)
 	}
 
 	instanceData.Status = "created"
-	createdInstance, err := m.repo.Create(instanceData)
-	if err != nil {
-		return nil, err
+	if err := m.repo.Create(instanceData); err != nil {
+		return nil, fmt.Errorf("falha ao guardar a instância: %w", err)
 	}
-
-	m.logger.Info("Instância criada e registrada", zap.String("name", createdInstance.Name))
-	return createdInstance, nil
+	return instanceData, nil
 }
 
-func (m *InstanceManager) ConnectInstance(name string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if client, exists := m.Instances[name]; exists && (client.Instance.Status == "open" || client.Instance.Status == "connecting") {
-		return "", fmt.Errorf("instância '%s' já está conectada ou conectando", name)
-	}
-
-	instanceData, err := m.repo.FindByName(name)
+// ConnectInstance conecta uma instância ao WhatsApp e retorna o QR Code se necessário.
+func (m *InstanceManager) ConnectInstance(ctx context.Context, instanceName string) (string, error) {
+	instanceData, err := m.repo.FindByName(instanceName)
 	if err != nil {
-		return "", fmt.Errorf("instância '%s' não encontrada no banco de dados", name)
+		return "", fmt.Errorf("falha ao encontrar a instância: %w", err)
+	}
+	if instanceData == nil {
+		return "", fmt.Errorf("instância não encontrada")
 	}
 
-	// CORREÇÃO: Passando o webhookService para o NewWhatsAppClient
-	client, err := NewWhatsAppClient(instanceData, m.logger, m.webhookService)
+	client := NewWhatsAppClient(instanceData, m.webhookService, m.logger)
+	m.instances.Store(instanceName, client)
+
+	qrCode, err := client.Connect(ctx)
 	if err != nil {
-		return "", fmt.Errorf("erro ao criar cliente do WhatsApp para '%s': %v", name, err)
+		m.instances.Delete(instanceName) // Limpa se a conexão falhar
+		return "", fmt.Errorf("falha ao conectar o cliente whatsapp: %w", err)
 	}
 
-	m.Instances[name] = client
+	instanceData.Status = "connecting"
+	m.repo.Update(instanceData)
 
-	qrCode, err := client.Connect()
-	if err != nil {
-		delete(m.Instances, name)
-		return "", fmt.Errorf("falha ao conectar instância '%s': %v", name, err)
-	}
-
-	m.logger.Info("Instância conectando...", zap.String("name", name))
 	return qrCode, nil
 }
 
-func (m *InstanceManager) DisconnectInstance(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	client, exists := m.Instances[name]
-	if !exists {
-		return fmt.Errorf("instância '%s' não está conectada ou não existe", name)
+// GetInstance retorna um cliente de instância ativo.
+func (m *InstanceManager) GetInstance(instanceName string) (*WhatsAppClient, bool) {
+	client, ok := m.instances.Load(instanceName)
+	if !ok {
+		return nil, false
 	}
-
-	if err := client.Disconnect(); err != nil {
-		m.logger.Error("Erro ao desconectar cliente WhatsApp, removendo da memória de qualquer forma", zap.Error(err), zap.String("instance", name))
-	}
-
-	delete(m.Instances, name)
-	m.logger.Info("Instância desconectada", zap.String("name", name))
-	return nil
+	return client.(*WhatsAppClient), true
 }
 
-func (m *InstanceManager) GetInstance(name string) (*WhatsAppClient, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	client, exists := m.Instances[name]
-	if !exists {
-		return nil, fmt.Errorf("instância '%s' não encontrada ou não está ativa", name)
-	}
-	return client, nil
-}
-
-func (m *InstanceManager) ListAllInstances() ([]*models.Instance, error) {
+// GetAllInstancesInfo retorna informações de todas as instâncias do repositório.
+func (m *InstanceManager) GetAllInstancesInfo() ([]*models.Instance, error) {
 	return m.repo.FindAll()
 }
 
-func (m *InstanceManager) GetInstanceStatus(name string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if client, exists := m.Instances[name]; exists {
-		return client.Instance.Status, nil
+// DisconnectInstance desconecta uma instância do WhatsApp.
+func (m *InstanceManager) DisconnectInstance(instanceName string) error {
+	client, ok := m.GetInstance(instanceName)
+	if !ok {
+		return fmt.Errorf("instância não encontrada ou não conectada")
 	}
 
-	instance, err := m.repo.FindByName(name)
+	client.Disconnect()
+	m.instances.Delete(instanceName)
+
+	instanceData, err := m.repo.FindByName(instanceName)
 	if err != nil {
-		return "not_found", err
+		return err
+	}
+	if instanceData != nil {
+		instanceData.Status = "disconnected"
+		m.repo.Update(instanceData)
 	}
 
-	return instance.Status, nil // Retorna o status do banco se não estiver ativo
+	return nil
 }
 
-func (m *InstanceManager) getInstanceByName(name string) (*models.Instance, error) {
-	return m.repo.FindByName(name)
+// DeleteInstance remove completamente uma instância.
+func (m *InstanceManager) DeleteInstance(instanceName string) error {
+	if client, ok := m.GetInstance(instanceName); ok {
+		client.Disconnect()
+		m.instances.Delete(instanceName)
+	}
+	return m.repo.Delete(instanceName)
 }
 
-func (m *InstanceManager) UpdateInstanceWebhook(name, webhookURL string) error {
-	instance, err := m.repo.FindByName(name)
+// RestoreInstances tenta reconectar instâncias que não estavam 'disconnected' ou 'created'.
+func (m *InstanceManager) RestoreInstances() {
+	m.logger.Info("A restaurar instâncias...")
+	instances, err := m.repo.FindAll()
 	if err != nil {
-		return fmt.Errorf("instância '%s' não encontrada", name)
+		m.logger.Error("Falha ao buscar instâncias para restaurar", zap.Error(err))
+		return
 	}
 
-	instance.WebhookURL = webhookURL
-	return m.repo.Update(instance)
-}
-
-func (m *InstanceManager) UpdateInstanceSettings(name string, settings *models.InstanceSettings) error {
-	instance, err := m.repo.FindByName(name)
-	if err != nil {
-		return fmt.Errorf("instância '%s' não encontrada", name)
+	for _, instance := range instances {
+		if instance.Status != "disconnected" && instance.Status != "created" {
+			go func(inst *models.Instance) {
+				m.logger.Info("A tentar restaurar a conexão", zap.String("instance", inst.Name))
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				_, err := m.ConnectInstance(ctx, inst.Name)
+				if err != nil {
+					m.logger.Error("Falha ao restaurar instância", zap.String("instance", inst.Name), zap.Error(err))
+				}
+			}(instance)
+		}
 	}
-
-	instance.Settings = *settings
-	return m.repo.Update(instance)
 }

@@ -10,7 +10,6 @@ import (
 )
 
 // InstanceRepository define a interface para operações de banco de dados para instâncias.
-// Usamos uma interface para facilitar os testes e a injeção de dependência.
 type InstanceRepository interface {
 	Create(instance *models.Instance) error
 	FindByName(name string) (*models.Instance, error)
@@ -19,12 +18,11 @@ type InstanceRepository interface {
 	Delete(name string) error
 }
 
-// postgresInstanceRepository é a implementação do InstanceRepository para PostgreSQL.
 type postgresInstanceRepository struct {
 	db *sql.DB
 }
 
-// NewPostgresInstanceRepository cria uma nova instância do repositório para PostgreSQL.
+// NewPostgresInstanceRepository cria uma nova instância do repositório de instâncias.
 func NewPostgresInstanceRepository(db *sql.DB) InstanceRepository {
 	return &postgresInstanceRepository{db: db}
 }
@@ -50,7 +48,7 @@ func (r *postgresInstanceRepository) FindByName(name string) (*models.Instance, 
 	err := row.Scan(&instance.ID, &instance.Name, &instance.ApiKey, &instance.WebhookURL, &instance.Status, &instance.CreatedAt, &instance.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil // Retorna nil se não encontrar, para ser tratado no serviço
+			return nil, nil // Retorna nil, nil se não encontrar, para não ser um erro.
 		}
 		return nil, err
 	}
@@ -59,7 +57,7 @@ func (r *postgresInstanceRepository) FindByName(name string) (*models.Instance, 
 
 // FindAll retorna todas as instâncias do banco de dados.
 func (r *postgresInstanceRepository) FindAll() ([]*models.Instance, error) {
-	query := `SELECT id, name, api_key, webhook_url, status, created_at, updated_at FROM instances`
+	query := `SELECT id, name, api_key, webhook_url, status, created_at, updated_at FROM instances ORDER BY created_at DESC`
 	rows, err := r.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -69,8 +67,7 @@ func (r *postgresInstanceRepository) FindAll() ([]*models.Instance, error) {
 	var instances []*models.Instance
 	for rows.Next() {
 		var instance models.Instance
-		err := rows.Scan(&instance.ID, &instance.Name, &instance.ApiKey, &instance.WebhookURL, &instance.Status, &instance.CreatedAt, &instance.UpdatedAt)
-		if err != nil {
+		if err := rows.Scan(&instance.ID, &instance.Name, &instance.ApiKey, &instance.WebhookURL, &instance.Status, &instance.CreatedAt, &instance.UpdatedAt); err != nil {
 			return nil, err
 		}
 		instances = append(instances, &instance)
