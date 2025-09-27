@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -226,14 +227,12 @@ func (wc *WhatsAppClient) downloadMedia(url string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to download media: status %d", resp.StatusCode)
 	}
 
-	// Read response body
-	mediaData := make([]byte, resp.ContentLength)
-	_, err = resp.Body.Read(mediaData)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read media data: %w", err)
 	}
 
-	return mediaData, nil
+	return data, nil
 }
 
 // eventHandler handles WhatsApp events
@@ -281,15 +280,18 @@ func (wc *WhatsAppClient) handleMessage(evt *events.Message) {
 	case evt.Message.GetExtendedTextMessage() != nil:
 		message.Message = evt.Message.GetExtendedTextMessage().GetText()
 	case evt.Message.GetImageMessage() != nil:
-		message.MediaURL = evt.Message.GetImageMessage().GetUrl()
+		message.MediaURL = evt.Message.GetImageMessage().GetURL()
 		message.Caption = evt.Message.GetImageMessage().GetCaption()
+		message.ViewOnce = evt.Message.GetImageMessage().GetViewOnce()
 	case evt.Message.GetVideoMessage() != nil:
-		message.MediaURL = evt.Message.GetVideoMessage().GetUrl()
+		message.MediaURL = evt.Message.GetVideoMessage().GetURL()
 		message.Caption = evt.Message.GetVideoMessage().GetCaption()
+		message.ViewOnce = evt.Message.GetVideoMessage().GetViewOnce()
 	case evt.Message.GetAudioMessage() != nil:
-		message.MediaURL = evt.Message.GetAudioMessage().GetUrl()
+		message.MediaURL = evt.Message.GetAudioMessage().GetURL()
+		message.ViewOnce = evt.Message.GetAudioMessage().GetViewOnce()
 	case evt.Message.GetDocumentMessage() != nil:
-		message.MediaURL = evt.Message.GetDocumentMessage().GetUrl()
+		message.MediaURL = evt.Message.GetDocumentMessage().GetURL()
 		message.Caption = evt.Message.GetDocumentMessage().GetCaption()
 		message.FileName = evt.Message.GetDocumentMessage().GetFileName()
 	}
