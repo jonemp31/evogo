@@ -1,370 +1,199 @@
 package services
 
 import (
-	"context"
+	"encoding/gob"
 	"fmt"
-	"net/http"
+	"os"
 	"time"
 
-	"github.com/evolution-api/evolution-go/internal/models"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
+	"github.com/Rhymen/go-whatsapp"
+	"github.com/jonemp31/evogo/internal/models"
 	"go.uber.org/zap"
 )
 
-// WhatsAppClient represents a WhatsApp client instance
+// WhatsAppClient gerencia a conexão e comunicação com o WhatsApp
 type WhatsAppClient struct {
-	client   *whatsmeow.Client
-	instance *models.Instance
-	store    *sqlstore.Device
-	qrCode   string
-	status   string
-	eventCh  chan interface{}
+	Conn          *whatsapp.Conn
+	Instance      *models.Instance
+	Logger        *zap.Logger
+	WebhookSender WebhookSender
+	StartTime     time.Time
 }
 
-// NewWhatsAppClient creates a new WhatsApp client
-func NewWhatsAppClient(instance *models.Instance, container *sqlstore.Container) (*WhatsAppClient, error) {
-	// Create device store for this instance
-	device := container.NewDevice()
-	device.ID = instance.ID
-
-	// Create logger
-	logger := waLog.Stdout("Client", "INFO", false)
-
-	// Create WhatsApp client
-	client := whatsmeow.NewClient(device, logger)
-
-	wc := &WhatsAppClient{
-		client:   client,
-		instance: instance,
-		store:    device,
-		status:   "close",
-		eventCh:  make(chan interface{}, 100),
-	}
-
-	// Add event handler
-	client.AddEventHandler(wc.eventHandler)
-
-	return wc, nil
+// WebhookSender define a interface para enviar webhooks.
+type WebhookSender interface {
+	SendWebhook(instanceName, eventType string, payload interface{})
 }
 
-// Connect connects to WhatsApp
-func (wc *WhatsAppClient) Connect(ctx context.Context) error {
-	wc.status = "connecting"
-	zap.L().Info("Connecting WhatsApp client", zap.String("instance", wc.instance.Name))
-
-	// Check if already logged in
-	if wc.client.IsLoggedIn() {
-		wc.status = "open"
-		return wc.client.Connect()
-	}
-
-	// Generate QR code if not logged in
-	qrChan, err := wc.client.GetQRChannel(ctx)
+// NewWhatsAppClient cria e inicializa um novo cliente WhatsApp
+func NewWhatsAppClient(instance *models.Instance, logger *zap.Logger, webhookSender WebhookSender) (*WhatsAppClient, error) {
+	conn, err := whatsapp.NewConn(20 * time.Second)
 	if err != nil {
-		return fmt.Errorf("failed to get QR channel: %w", err)
+		return nil, fmt.Errorf("falha ao criar conexão: %v", err)
 	}
 
-	// Connect client
-	if err := wc.client.Connect(); err != nil {
-		wc.status = "close"
-		return fmt.Errorf("failed to connect client: %w", err)
+	client := &WhatsAppClient{
+		Conn:          conn,
+		Instance:      instance,
+		Logger:        logger,
+		WebhookSender: webhookSender,
 	}
 
-	// Wait for QR code
-	select {
-	case evt := <-qrChan:
-		if evt.Event == "code" {
-			wc.qrCode = evt.Code
-			zap.L().Info("QR code generated", zap.String("instance", wc.instance.Name))
-			return nil
+	client.Conn.AddHandler(client.eventHandler)
+	return client, nil
+}
+
+func (wac *WhatsAppClient) eventHandler(event interface{}) {
+	wac.Logger.Debug("Evento recebido", zap.Any("type", fmt.Sprintf("%T", event)))
+
+	switch e := event.(type) {
+	case *whatsapp.TextMessage:
+		wac.handleMessage(e.Info, map[string]interface{}{"conversation": e.Text})
+	case *whatsapp.ImageMessage:
+		wac.handleMessage(e.Info, map[string]interface{}{"imageMessage": map[string]interface{}{"caption": e.Caption, "mimetype": e.Type}})
+	case *whatsapp.VideoMessage:
+		wac.handleMessage(e.Info, map[string]interface{}{"videoMessage": map[string]interface{}{"caption": e.Caption, "mimetype": e.Type}})
+	case *whatsapp.AudioMessage:
+		wac.handleMessage(e.Info, map[string]interface{}{"audioMessage": map[string]interface{}{"ptt": e.Ptt, "mimetype": e.Type}})
+	case *whatsapp.DocumentMessage:
+		wac.handleMessage(e.Info, map[string]interface{}{"documentMessage": map[string]interface{}{"title": e.Title, "mimetype": e.Type}})
+
+	case *whatsapp.ConnectingEvent:
+		wac.Instance.Status = "connecting"
+		wac.WebhookSender.SendWebhook(wac.Instance.Name, "connection.update", map[string]string{"status": "connecting"})
+	case *whatsapp.ConnectedEvent:
+		wac.Instance.Status = "open"
+		wac.StartTime = time.Now()
+		wac.WebhookSender.SendWebhook(wac.Instance.Name, "connection.update", map[string]string{"status": "open"})
+	case *whatsapp.DisconnectedEvent:
+		wac.Instance.Status = "close"
+		wac.WebhookSender.SendWebhook(wac.Instance.Name, "connection.update", map[string]string{"status": "close"})
+	case *whatsapp.ErrorEvent:
+		wac.Logger.Error("Erro recebido da conexão", zap.Error(e.Err))
+
+	case whatsapp.Presence:
+		payload := map[string]interface{}{"jid": e.Jid, "presence": e.Type, "t": e.Timestamp}
+		wac.WebhookSender.SendWebhook(wac.Instance.Name, "presence.update", payload)
+
+	case whatsapp.Receipt:
+		if e.Type == whatsapp.ReceiptTypeRead || e.Type == whatsapp.ReceiptTypeDelivered {
+			payload := map[string]interface{}{"id": e.MessageID, "remoteJid": e.Jid, "status": e.Type, "t": e.Timestamp}
+			wac.WebhookSender.SendWebhook(wac.Instance.Name, "messages.update", payload)
 		}
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("QR code generation timeout")
+	}
+}
+
+func (wac *WhatsAppClient) handleMessage(info whatsapp.MessageInfo, messageContent map[string]interface{}) {
+	if info.Timestamp < uint64(wac.StartTime.Unix()) {
+		return
+	}
+	payload := map[string]interface{}{
+		"event":    "messages.upsert",
+		"instance": wac.Instance.Name,
+		"data": map[string]interface{}{
+			"key":              map[string]interface{}{"remoteJid": info.RemoteJid, "fromMe": info.FromMe, "id": info.Id},
+			"pushName":         info.Sender.Name,
+			"message":          messageContent,
+			"messageTimestamp": info.Timestamp,
+		},
+	}
+	wac.WebhookSender.SendWebhook(wac.Instance.Name, "messages.upsert", payload)
+}
+
+func (wac *WhatsAppClient) Connect() (string, error) {
+	session, err := wac.readSession()
+	if err == nil {
+		wac.Logger.Info("Restaurando sessão existente...")
+		session, err = wac.Conn.RestoreWithSession(session)
+		if err != nil {
+			wac.Logger.Warn("Falha ao restaurar sessão, será necessário um novo QR Code", zap.Error(err))
+			return wac.loginWithNewQRCode()
+		}
+		return "", nil // Conexão restaurada, sem QR code
 	}
 
+	wac.Logger.Info("Nenhuma sessão encontrada ou falha ao ler.")
+	return wac.loginWithNewQRCode()
+}
+
+func (wac *WhatsAppClient) loginWithNewQRCode() (string, error) {
+	qr := make(chan string)
+	var loginErr error
+	go func() {
+		_, loginErr = wac.Conn.Login(qr)
+		if loginErr != nil {
+			close(qr) // Fecha o canal se o login falhar
+		}
+	}()
+
+	qrCode, ok := <-qr
+	if !ok {
+		return "", fmt.Errorf("falha no login com QR Code: %w", loginErr)
+	}
+	return qrCode, nil
+}
+
+func (wac *WhatsAppClient) Disconnect() error {
+	if wac.Conn != nil {
+		defer wac.Conn.Disconnect()
+		return wac.saveSession()
+	}
 	return nil
 }
 
-// GetQRCode returns the current QR code
-func (wc *WhatsAppClient) GetQRCode() string {
-	return wc.qrCode
+func (wac *WhatsAppClient) SendTextMessage(remoteJid, text string) (string, error) {
+	msg := whatsapp.TextMessage{Info: whatsapp.MessageInfo{RemoteJid: remoteJid}, Text: text}
+	return wac.Conn.Send(msg)
 }
 
-// GetStatus returns the connection status
-func (wc *WhatsAppClient) GetStatus() string {
-	if wc.client.IsConnected() && wc.client.IsLoggedIn() {
-		return "open"
-	}
-	if wc.status == "connecting" {
-		return "connecting"
-	}
-	return "close"
-}
-
-// SendText sends a text message
-func (wc *WhatsAppClient) SendText(ctx context.Context, to, message string) (string, error) {
-	if wc.status != "open" {
-		return "", fmt.Errorf("client not connected")
-	}
-
-	jid, err := types.ParseJID(to)
-	if err != nil {
-		return "", fmt.Errorf("invalid JID: %w", err)
-	}
-
-	msg := &types.Message{
-		Conversation: &message,
-	}
-
-	resp, err := wc.client.SendMessage(ctx, jid, msg)
-	if err != nil {
-		return "", fmt.Errorf("failed to send message: %w", err)
-	}
-
-	return resp.ID, nil
-}
-
-// SendMedia sends a media message (image, video, audio, document)
-func (wc *WhatsAppClient) SendMedia(ctx context.Context, to, mediaURL, mediaType, caption string, viewOnce bool) (string, error) {
-	if wc.status != "open" {
-		return "", fmt.Errorf("client not connected")
-	}
-
-	jid, err := types.ParseJID(to)
-	if err != nil {
-		return "", fmt.Errorf("invalid JID: %w", err)
-	}
-
-	// Download media from URL
-	mediaData, err := wc.downloadMedia(mediaURL)
-	if err != nil {
-		return "", fmt.Errorf("failed to download media: %w", err)
-	}
-
-	var msg *types.Message
-
+func (wac *WhatsAppClient) SendMediaMessage(remoteJid, mediaType string, data []byte, mimeType, caption string, viewOnce, ptt bool) (string, error) {
+	var msg interface{}
 	switch mediaType {
 	case "image":
-		imageMsg := &types.ImageMessage{
-			Caption:  &caption,
-			ViewOnce: viewOnce,
-		}
-		imageMsg.URL, err = wc.client.Upload(ctx, mediaData, whatsmeow.MediaImage)
-		if err != nil {
-			return "", fmt.Errorf("failed to upload image: %w", err)
-		}
-		msg = &types.Message{ImageMessage: imageMsg}
-
+		msg = whatsapp.ImageMessage{Info: whatsapp.MessageInfo{RemoteJid: remoteJid}, Type: mimeType, Content: data, Caption: caption, ViewOnce: viewOnce}
 	case "video":
-		videoMsg := &types.VideoMessage{
-			Caption:  &caption,
-			ViewOnce: viewOnce,
-		}
-		videoMsg.URL, err = wc.client.Upload(ctx, mediaData, whatsmeow.MediaVideo)
-		if err != nil {
-			return "", fmt.Errorf("failed to upload video: %w", err)
-		}
-		msg = &types.Message{VideoMessage: videoMsg}
-
+		msg = whatsapp.VideoMessage{Info: whatsapp.MessageInfo{RemoteJid: remoteJid}, Type: mimeType, Content: data, Caption: caption, ViewOnce: viewOnce}
 	case "audio":
-		audioMsg := &types.AudioMessage{
-			ViewOnce: viewOnce,
-		}
-		audioMsg.URL, err = wc.client.Upload(ctx, mediaData, whatsmeow.MediaAudio)
-		if err != nil {
-			return "", fmt.Errorf("failed to upload audio: %w", err)
-		}
-		msg = &types.Message{AudioMessage: audioMsg}
-
+		msg = whatsapp.AudioMessage{Info: whatsapp.MessageInfo{RemoteJid: remoteJid}, Type: mimeType, Content: data, Ptt: ptt}
 	case "document":
-		docMsg := &types.DocumentMessage{
-			Caption: &caption,
-		}
-		docMsg.URL, err = wc.client.Upload(ctx, mediaData, whatsmeow.MediaDocument)
-		if err != nil {
-			return "", fmt.Errorf("failed to upload document: %w", err)
-		}
-		msg = &types.Message{DocumentMessage: docMsg}
-
+		msg = whatsapp.DocumentMessage{Info: whatsapp.MessageInfo{RemoteJid: remoteJid}, Type: mimeType, Content: data, Title: caption}
 	default:
-		return "", fmt.Errorf("unsupported media type: %s", mediaType)
+		return "", fmt.Errorf("tipo de mídia não suportado: %s", mediaType)
 	}
+	return wac.Conn.Send(msg)
+}
 
-	resp, err := wc.client.SendMessage(ctx, jid, msg)
+func (wac *WhatsAppClient) saveSession() error {
+	session, err := wac.Conn.Store()
 	if err != nil {
-		return "", fmt.Errorf("failed to send media message: %w", err)
+		return fmt.Errorf("erro ao obter sessão para salvar: %w", err)
 	}
-
-	return resp.ID, nil
-}
-
-// Logout logs out the client
-func (wc *WhatsAppClient) Logout(ctx context.Context) error {
-	wc.status = "close"
-	return wc.client.Logout(ctx)
-}
-
-// Disconnect disconnects the client
-func (wc *WhatsAppClient) Disconnect() {
-	wc.status = "close"
-	wc.client.Disconnect()
-}
-
-// downloadMedia downloads media from URL
-func (wc *WhatsAppClient) downloadMedia(url string) ([]byte, error) {
-	resp, err := http.Get(url)
+	_ = os.MkdirAll("./sessions", os.ModePerm)
+	filePath := fmt.Sprintf("./sessions/%s.gob", wac.Instance.Name)
+	file, err := os.Create(filePath)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("erro ao criar arquivo de sessão: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download media: status %d", resp.StatusCode)
+	defer file.Close()
+	encoder := gob.NewEncoder(file)
+	if err := encoder.Encode(session); err != nil {
+		return fmt.Errorf("erro ao salvar sessão: %w", err)
 	}
+	wac.Logger.Info("Sessão salva com sucesso", zap.String("instance", wac.Instance.Name))
+	return nil
+}
 
-	// Read response body
-	mediaData := make([]byte, resp.ContentLength)
-	_, err = resp.Body.Read(mediaData)
+func (wac *WhatsAppClient) readSession() (whatsapp.Session, error) {
+	var session whatsapp.Session
+	filePath := fmt.Sprintf("./sessions/%s.gob", wac.Instance.Name)
+	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return session, fmt.Errorf("erro ao abrir arquivo de sessão: %w", err)
 	}
-
-	return mediaData, nil
-}
-
-// eventHandler handles WhatsApp events
-func (wc *WhatsAppClient) eventHandler(evt interface{}) {
-	switch e := evt.(type) {
-	case *events.Connected:
-		wc.status = "open"
-		zap.L().Info("WhatsApp client connected", zap.String("instance", wc.instance.Name))
-
-	case *events.Disconnected:
-		wc.status = "close"
-		zap.L().Info("WhatsApp client disconnected", zap.String("instance", wc.instance.Name))
-
-	case *events.Message:
-		wc.handleMessage(e)
-
-	case *events.MessageStatus:
-		wc.handleMessageStatus(e)
-
-	case *events.Presence:
-		wc.handlePresence(e)
-
-	case *events.ChatPresence:
-		wc.handleChatPresence(e)
+	defer file.Close()
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(&session); err != nil {
+		return session, fmt.Errorf("erro ao decodificar sessão: %w", err)
 	}
-}
-
-// handleMessage handles incoming messages
-func (wc *WhatsAppClient) handleMessage(evt *events.Message) {
-	message := &models.Message{
-		ID:          evt.Info.ID,
-		InstanceID:  wc.instance.ID,
-		RemoteJID:   evt.Info.Chat.String(),
-		FromMe:      evt.Info.IsFromMe,
-		MessageType: wc.getMessageType(evt.Message),
-		Timestamp:   evt.Info.Timestamp,
-		Status:      "received",
-		CreatedAt:   time.Now(),
-	}
-
-	// Extract message content based on type
-	switch {
-	case evt.Message.GetConversation() != "":
-		message.Message = evt.Message.GetConversation()
-	case evt.Message.GetExtendedTextMessage() != nil:
-		message.Message = evt.Message.GetExtendedTextMessage().GetText()
-	case evt.Message.GetImageMessage() != nil:
-		message.MediaURL = evt.Message.GetImageMessage().GetUrl()
-		message.Caption = evt.Message.GetImageMessage().GetCaption()
-	case evt.Message.GetVideoMessage() != nil:
-		message.MediaURL = evt.Message.GetVideoMessage().GetUrl()
-		message.Caption = evt.Message.GetVideoMessage().GetCaption()
-	case evt.Message.GetAudioMessage() != nil:
-		message.MediaURL = evt.Message.GetAudioMessage().GetUrl()
-	case evt.Message.GetDocumentMessage() != nil:
-		message.MediaURL = evt.Message.GetDocumentMessage().GetUrl()
-		message.Caption = evt.Message.GetDocumentMessage().GetCaption()
-		message.FileName = evt.Message.GetDocumentMessage().GetFileName()
-	}
-
-	// Send webhook event
-	wc.sendWebhookEvent("messages.upsert", message)
-}
-
-// handleMessageStatus handles message status updates
-func (wc *WhatsAppClient) handleMessageStatus(evt *events.MessageStatus) {
-	// Send webhook event for message status
-	wc.sendWebhookEvent("messages.update", map[string]interface{}{
-		"id":     evt.Info.ID,
-		"status": string(evt.Status),
-	})
-}
-
-// handlePresence handles presence updates
-func (wc *WhatsAppClient) handlePresence(evt *events.Presence) {
-	wc.sendWebhookEvent("presence.update", map[string]interface{}{
-		"jid":      evt.From.String(),
-		"presence": evt.Presence,
-	})
-}
-
-// handleChatPresence handles chat presence updates
-func (wc *WhatsAppClient) handleChatPresence(evt *events.ChatPresence) {
-	wc.sendWebhookEvent("chat.presence", map[string]interface{}{
-		"jid":      evt.MessageSource.Chat.String(),
-		"presence": evt.State,
-	})
-}
-
-// getMessageType extracts message type from WhatsApp message
-func (wc *WhatsAppClient) getMessageType(msg *types.Message) string {
-	switch {
-	case msg.GetConversation() != "":
-		return "conversation"
-	case msg.GetImageMessage() != nil:
-		return "imageMessage"
-	case msg.GetVideoMessage() != nil:
-		return "videoMessage"
-	case msg.GetAudioMessage() != nil:
-		return "audioMessage"
-	case msg.GetDocumentMessage() != nil:
-		return "documentMessage"
-	case msg.GetStickerMessage() != nil:
-		return "stickerMessage"
-	case msg.GetLocationMessage() != nil:
-		return "locationMessage"
-	case msg.GetContactMessage() != nil:
-		return "contactMessage"
-	default:
-		return "unknown"
-	}
-}
-
-// sendWebhookEvent sends a webhook event
-func (wc *WhatsAppClient) sendWebhookEvent(event string, data interface{}) {
-	if wc.instance.WebhookURL == "" {
-		return
-	}
-
-	webhookEvent := &models.WebhookEvent{
-		Event:     event,
-		Instance:  wc.instance.Name,
-		Data:      data,
-		Timestamp: time.Now(),
-	}
-
-	// Send webhook asynchronously
-	go func() {
-		// Implementation will be in webhook service
-		zap.L().Debug("Sending webhook event",
-			zap.String("instance", wc.instance.Name),
-			zap.String("event", event))
-	}()
+	return session, nil
 }

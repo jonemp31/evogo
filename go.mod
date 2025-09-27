@@ -1,8 +1,9 @@
-module github.com/evolution-api/evolution-go
+module github.com/jonemp31/evogo
 
 go 1.21
 
 require (
+	github.com/Rhymen/go-whatsapp v0.1.1
 	github.com/gin-gonic/gin v1.9.1
 	github.com/go-playground/validator/v10 v10.16.0
 	github.com/go-redis/redis/v8 v8.11.5
@@ -11,7 +12,6 @@ require (
 	github.com/lib/pq v1.10.9
 	github.com/prometheus/client_golang v1.17.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
-	go.mau.fi/whatsmeow v0.0.0-20250825151841-7b1a3f7e5746
 	go.uber.org/zap v1.26.0
 	golang.org/x/net v0.17.0
 )
@@ -35,8 +35,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.0.8 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.2.11 // indirect
-	go.mau.fi/libsignal v0.1.0 // indirect
-	go.mau.fi/util v0.2.1 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/arch v0.3.0 // indirect
 	golang.org/x/crypto v0.14.0 // indirect
