@@ -4,249 +4,81 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/evolution-api/evolution-go/internal/models"
+	"github.com/jonemp31/evogo/internal/models"
 	"go.uber.org/zap"
 )
 
-// WebhookService handles webhook operations
+// WebhookSender define a interface para enviar webhooks.
+// Isso nos permite trocar a implementação ou usar um mock para testes.
+type WebhookSender interface {
+	SendWebhook(ctx context.Context, url string, event *models.WebhookEvent) error
+}
+
 type WebhookService struct {
-	httpClient    *http.Client
-	retryAttempts int
-	timeout       time.Duration
+	client *http.Client
+	logger *zap.Logger
 }
 
-// NewWebhookService creates a new webhook service
-func NewWebhookService(timeout time.Duration, retryAttempts int) *WebhookService {
+func NewWebhookService(logger *zap.Logger) WebhookSender {
 	return &WebhookService{
-		httpClient: &http.Client{
-			Timeout: timeout,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
 		},
-		retryAttempts: retryAttempts,
-		timeout:       timeout,
+		logger: logger,
 	}
 }
 
-// SendWebhook sends a webhook event
-func (ws *WebhookService) SendWebhook(ctx context.Context, url string, event *models.WebhookEvent) error {
-	jsonData, err := json.Marshal(event)
+// SendWebhook envia um evento para a URL especificada com retentativas.
+func (s *WebhookService) SendWebhook(ctx context.Context, url string, event *models.WebhookEvent) error {
+	log := s.logger.With(zap.String("event", event.Event), zap.String("instance", event.Instance))
+	log.Info("Sending webhook", zap.String("url", url))
+
+	payload, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("failed to marshal webhook payload: %w", err)
+		log.Error("Failed to marshal webhook payload", zap.Error(err))
+		return err // Não adianta tentar de novo se o payload é inválido
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create webhook request: %w", err)
-	}
+	// Lógica de retentativa (Exponential Backoff)
+	maxRetries := 3
+	baseDelay := 1 * time.Second
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Evolution-API-Go/1.0")
-
-	// Send with retries
-	for attempt := 1; attempt <= ws.retryAttempts; attempt++ {
-		resp, err := ws.httpClient.Do(req)
+	for i := 0; i < maxRetries; i++ {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payload))
 		if err != nil {
-			zap.L().Warn("Webhook send attempt failed",
-				zap.Int("attempt", attempt),
-				zap.String("url", url),
-				zap.Error(err))
+			log.Error("Failed to create webhook request", zap.Error(err))
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		// Adicione aqui outros headers, como uma chave de autenticação, se necessário
 
-			if attempt == ws.retryAttempts {
-				return fmt.Errorf("failed to send webhook after %d attempts: %w", ws.retryAttempts, err)
-			}
-
-			// Wait before retry
-			time.Sleep(time.Duration(attempt) * time.Second)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			log.Warn("Failed to send webhook, retrying...", zap.Int("attempt", i+1), zap.Error(err))
+			time.Sleep(baseDelay)
+			baseDelay *= 2 // Aumenta o delay
 			continue
 		}
 
-		resp.Body.Close()
-
+		// Se o status for 2xx, consideramos sucesso
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			zap.L().Debug("Webhook sent successfully",
-				zap.String("url", url),
-				zap.String("event", event.Event),
-				zap.Int("status", resp.StatusCode))
+			log.Info("Webhook sent successfully", zap.Int("status_code", resp.StatusCode))
+			resp.Body.Close()
 			return nil
 		}
 
-		zap.L().Warn("Webhook returned non-success status",
-			zap.Int("attempt", attempt),
-			zap.String("url", url),
-			zap.Int("status", resp.StatusCode))
-
-		if attempt == ws.retryAttempts {
-			return fmt.Errorf("webhook returned status %d", resp.StatusCode)
-		}
-
-		// Wait before retry
-		time.Sleep(time.Duration(attempt) * time.Second)
+		log.Warn("Webhook received non-success status, retrying...",
+			zap.Int("attempt", i+1),
+			zap.Int("status_code", resp.StatusCode),
+		)
+		resp.Body.Close()
+		time.Sleep(baseDelay)
+		baseDelay *= 2
 	}
 
-	return nil
-}
-
-// SendInstanceEvent sends an instance-related webhook event
-func (ws *WebhookService) SendInstanceEvent(ctx context.Context, instance *models.Instance, eventType string, data interface{}) {
-	if instance.WebhookURL == "" {
-		return
-	}
-
-	// Check if event should be sent based on webhook events filter
-	if len(instance.WebhookEvents) > 0 {
-		shouldSend := false
-		for _, event := range instance.WebhookEvents {
-			if event == eventType {
-				shouldSend = true
-				break
-			}
-		}
-		if !shouldSend {
-			return
-		}
-	}
-
-	webhookEvent := &models.WebhookEvent{
-		Event:     eventType,
-		Instance:  instance.Name,
-		Data:      data,
-		Timestamp: time.Now(),
-	}
-
-	// Send webhook asynchronously
-	go func() {
-		if err := ws.SendWebhook(context.Background(), instance.WebhookURL, webhookEvent); err != nil {
-			zap.L().Error("Failed to send webhook",
-				zap.String("instance", instance.Name),
-				zap.String("event", eventType),
-				zap.Error(err))
-		}
-	}()
-}
-
-// SendMessageEvent sends a message-related webhook event
-func (ws *WebhookService) SendMessageEvent(ctx context.Context, instance *models.Instance, eventType string, message *models.Message) {
-	if instance.WebhookURL == "" {
-		return
-	}
-
-	// Check if event should be sent based on webhook events filter
-	if len(instance.WebhookEvents) > 0 {
-		shouldSend := false
-		for _, event := range instance.WebhookEvents {
-			if event == eventType {
-				shouldSend = true
-				break
-			}
-		}
-		if !shouldSend {
-			return
-		}
-	}
-
-	webhookEvent := &models.WebhookEvent{
-		Event:     eventType,
-		Instance:  instance.Name,
-		Data:      message,
-		Timestamp: time.Now(),
-	}
-
-	// Send webhook asynchronously
-	go func() {
-		if err := ws.SendWebhook(context.Background(), instance.WebhookURL, webhookEvent); err != nil {
-			zap.L().Error("Failed to send message webhook",
-				zap.String("instance", instance.Name),
-				zap.String("event", eventType),
-				zap.Error(err))
-		}
-	}()
-}
-
-// SendConnectionEvent sends a connection status webhook event
-func (ws *WebhookService) SendConnectionEvent(ctx context.Context, instance *models.Instance, status string) {
-	if instance.WebhookURL == "" {
-		return
-	}
-
-	// Check if event should be sent based on webhook events filter
-	if len(instance.WebhookEvents) > 0 {
-		shouldSend := false
-		for _, event := range instance.WebhookEvents {
-			if event == "connection.update" {
-				shouldSend = true
-				break
-			}
-		}
-		if !shouldSend {
-			return
-		}
-	}
-
-	connectionData := map[string]interface{}{
-		"instance": map[string]interface{}{
-			"instanceName": instance.Name,
-			"state":        status,
-		},
-	}
-
-	webhookEvent := &models.WebhookEvent{
-		Event:     "connection.update",
-		Instance:  instance.Name,
-		Data:      connectionData,
-		Timestamp: time.Now(),
-	}
-
-	// Send webhook asynchronously
-	go func() {
-		if err := ws.SendWebhook(context.Background(), instance.WebhookURL, webhookEvent); err != nil {
-			zap.L().Error("Failed to send connection webhook",
-				zap.String("instance", instance.Name),
-				zap.Error(err))
-		}
-	}()
-}
-
-// SendQRCodeEvent sends a QR code webhook event
-func (ws *WebhookService) SendQRCodeEvent(ctx context.Context, instance *models.Instance, qrCode string) {
-	if instance.WebhookURL == "" {
-		return
-	}
-
-	// Check if event should be sent based on webhook events filter
-	if len(instance.WebhookEvents) > 0 {
-		shouldSend := false
-		for _, event := range instance.WebhookEvents {
-			if event == "qrcode.updated" {
-				shouldSend = true
-				break
-			}
-		}
-		if !shouldSend {
-			return
-		}
-	}
-
-	qrData := map[string]interface{}{
-		"base64": fmt.Sprintf("data:image/png;base64,%s", qrCode),
-		"code":   qrCode,
-	}
-
-	webhookEvent := &models.WebhookEvent{
-		Event:     "qrcode.updated",
-		Instance:  instance.Name,
-		Data:      qrData,
-		Timestamp: time.Now(),
-	}
-
-	// Send webhook asynchronously
-	go func() {
-		if err := ws.SendWebhook(context.Background(), instance.WebhookURL, webhookEvent); err != nil {
-			zap.L().Error("Failed to send QR code webhook",
-				zap.String("instance", instance.Name),
-				zap.Error(err))
-		}
-	}()
+	log.Error("Failed to send webhook after multiple retries")
+	return nil // Retornamos nil para não bloquear o fluxo principal da aplicação
 }
